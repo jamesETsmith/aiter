@@ -15,23 +15,18 @@ NOTE: Do NOT use ``from __future__ import annotations`` here -- it breaks
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import gpu as _mlir_gpu
 from flydsl._mlir.dialects import llvm, scf
 from flydsl._mlir.dialects import math as _math
 from flydsl._mlir.dialects import memref as _memref
-from flydsl._mlir.dialects import gpu as _mlir_gpu
 from flydsl._mlir.dialects._arith_enum_gen import CmpIPredicate
-
-from flydsl.expr import arith, vector, gpu, buffer_ops, rocdl
-from flydsl.expr import range_constexpr
+from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl, vector
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import T
-
-from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.utils.smem_allocator import SmemAllocator
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
-
+from flydsl.utils.smem_allocator import SmemAllocator
 
 # ---------------------------------------------------------------------------
 # Compile-time constants (mirroring HkMlaDecodeFwdTraits)
@@ -1867,13 +1862,11 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
         # Initialize softmax state
         row_max = _raw(c_neg_inf_f32)
         row_sum_e = _raw(c_zero_f32)
-        oaccu = [_raw(c_zero_v4f32)] * (NUM_PV_ITERS * 2)
 
         # Compute number of tiles
         c_block_n = arith.constant(BLOCK_N, type=T.i32)
         c_block_n_m1 = arith.constant(BLOCK_N - 1, type=T.i32)
         num_tiles = arith.divui(arith.addi(kv_len, c_block_n_m1), c_block_n)
-        num_tiles_idx = arith.index_cast(T.index, num_tiles)
 
         # --- Pre-compute boundary flags ---
         first_tile_needs_boundary = arith.cmpi(
