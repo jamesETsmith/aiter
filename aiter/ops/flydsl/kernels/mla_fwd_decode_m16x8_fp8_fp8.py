@@ -43,7 +43,6 @@ QK_NOPE_HEAD_DIM: int = KV_LORA_RANK  # 512
 QK_ROPE_HEAD_DIM: int = 64
 QK_HEAD_DIM: int = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM  # 576
 V_HEAD_DIM: int = KV_LORA_RANK  # 512
-PAGE_SIZE: int = 1
 NUM_WARPS: int = 8
 WARP_SIZE: int = 64
 NUM_THREADS: int = NUM_WARPS * WARP_SIZE  # 512
@@ -178,15 +177,9 @@ def _barrier(vmcnt=63, lgkmcnt=63):
     )
 
 
-_LDS_PTR_TYPE = None
-
-
 def _inttoptr_lds(i64_val):
     """Convert i64 scalar to !llvm.ptr<3> (LDS pointer)."""
-    global _LDS_PTR_TYPE
-    if _LDS_PTR_TYPE is None:
-        _LDS_PTR_TYPE = ir.Type.parse("!llvm.ptr<3>")
-    return llvm.inttoptr(_LDS_PTR_TYPE, i64_val)
+    return llvm.inttoptr(ir.Type.parse("!llvm.ptr<3>"), i64_val)
 
 
 def _get_element_ptr(base_ptr, byte_offset=None, static_byte_offset=0, elem_type=None):
@@ -335,8 +328,9 @@ _set_mfma_vgpr_form()
 def kn_mla_fwd_decode_m16x8_fp8_fp8(
     # --- inputs ---
     query: fx.Tensor,  # [num_seqs * num_heads, qk_head_dim]  (fp8)
-    kv_buffer: fx.Tensor,  # [num_pages, qk_head_dim]  (fp8)
+    kv_buffer: fx.Tensor,  # [num_pages * page_size, qk_head_dim]  (fp8)
     kv_page_indices: fx.Tensor,  # [num_page_used]  (i32)
+    kv_last_page_lens: fx.Tensor,  # [num_batches]  (i32)
     # --- metadata ---
     work_indptr: fx.Tensor,  # [num_workers + 1]  (i32)
     work_info_set: fx.Tensor,  # [num_work_items * 8]  (i32)
@@ -344,10 +338,14 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
     final_output: fx.Tensor,  # [num_seqs * num_heads, v_head_dim]  (bf16)
     split_output: fx.Tensor,  # [num_partial_slots * num_heads, v_head_dim]  (f32)
     split_lse: fx.Tensor,  # [num_partial_slots * num_heads]  (f32)
+    q_scale: fx.Tensor,  # [1]  (f32)
+    kv_scale: fx.Tensor,  # [1]  (f32)
     # --- parameters ---
     softmax_scale: fx.Float32,
+    num_qheads: fx.Constexpr[int],
+    page_size: fx.Constexpr[int],
 ):
-    """MLA decode forward kernel (nhead=128, fp8/fp8 -> bf16).
+    """MLA decode forward kernel (packed M=128, fp8/fp8 -> bf16).
 
     Persistent-thread kernel: each workgroup picks up work items
     from ``work_indptr`` / ``work_info_set`` and processes them sequentially.
@@ -414,11 +412,25 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
     query_rsrc = buffer_ops.create_buffer_resource(query)
     kv_rsrc = buffer_ops.create_buffer_resource(kv_buffer)
     kv_page_indices_rsrc = buffer_ops.create_buffer_resource(kv_page_indices)
+    kv_last_page_lens_rsrc = buffer_ops.create_buffer_resource(kv_last_page_lens)
     work_indptr_rsrc = buffer_ops.create_buffer_resource(work_indptr)
     work_info_set_rsrc = buffer_ops.create_buffer_resource(work_info_set)
     final_output_rsrc = buffer_ops.create_buffer_resource(final_output)
     split_output_rsrc = buffer_ops.create_buffer_resource(split_output)
     split_lse_rsrc = buffer_ops.create_buffer_resource(split_lse)
+    q_scale_rsrc = buffer_ops.create_buffer_resource(q_scale)
+    kv_scale_rsrc = buffer_ops.create_buffer_resource(kv_scale)
+    q_descale = buffer_ops.buffer_load(
+        q_scale_rsrc, arith.constant(0, type=T.i32), vec_width=1, dtype=T.f32
+    )
+    kv_descale = buffer_ops.buffer_load(
+        kv_scale_rsrc, arith.constant(0, type=T.i32), vec_width=1, dtype=T.f32
+    )
+    attention_scale = arith.MulFOp(
+        arith.MulFOp(_raw(softmax_scale), _raw(q_descale), fastmath=fm_fast).result,
+        _raw(kv_descale),
+        fastmath=fm_fast,
+    ).result
 
     # ---- Thread indices ----
     worker_idx = gpu.block_idx.x
@@ -427,6 +439,8 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
     lane_idx = tid % arith.index(WARP_SIZE)
     warp_idx_i32 = rocdl.readfirstlane(T.i32, _raw(_index_cast_to_i32(warp_idx)))
     lane_idx_i32 = _index_cast_to_i32(lane_idx)
+    waves_per_query = num_qheads // TILE_M
+    query_position = warp_idx_i32 // arith.constant(waves_per_query, type=T.i32)
 
     # ---- Work range ----
     worker_idx_i32 = _index_cast_to_i32(worker_idx)
@@ -458,24 +472,30 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
         For OOB rows, load the valid first page-table entry and select -1. This
         keeps the helper branch-free so it remains valid inside rewritten loops.
         """
-        row_idx_i32 = _raw(kv_ld_row_base_i32 + kv_tile_start_i32)
-        if check_boundary is False:
-            phys_row = buffer_ops.buffer_load(
-                kv_page_indices_rsrc, row_idx_i32, vec_width=1, dtype=T.i32
-            )
-            return _raw(phys_row)
-
+        token_idx_i32 = _raw(kv_ld_row_base_i32 + kv_tile_start_i32)
         in_bounds = arith.cmpi(
-            CmpIPredicate.slt, row_idx_i32, _raw(kv_tile_end_i32)
+            CmpIPredicate.slt, token_idx_i32, _raw(kv_tile_end_i32)
         )
-        safe_row_idx = arith.select(
-            in_bounds, row_idx_i32, _raw(arith.constant(0, type=T.i32))
+        safe_token_idx = arith.select(
+            in_bounds, token_idx_i32, _raw(arith.constant(0, type=T.i32))
         )
-        phys_row = buffer_ops.buffer_load(
-            kv_page_indices_rsrc, safe_row_idx, vec_width=1, dtype=T.i32
+        page_idx = arith.divui(
+            safe_token_idx, _raw(arith.constant(page_size, type=T.i32))
+        )
+        token_in_page = arith.remui(
+            safe_token_idx, _raw(arith.constant(page_size, type=T.i32))
+        )
+        physical_page = buffer_ops.buffer_load(
+            kv_page_indices_rsrc, page_idx, vec_width=1, dtype=T.i32
+        )
+        physical_row = arith.addi(
+            arith.muli(
+                _raw(physical_page), _raw(arith.constant(page_size, type=T.i32))
+            ),
+            token_in_page,
         )
         return arith.select(
-            in_bounds, _raw(phys_row), _raw(arith.constant(-1, type=T.i32))
+            in_bounds, physical_row, _raw(arith.constant(-1, type=T.i32))
         )
 
     # ---- Helper: async_load_k_tile (VRAM->LDS via buffer_load_dword_lds) ----
@@ -901,10 +921,10 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
         # s_offset = warp * 16 * QK_HEAD_DIM * sizeof(fp8)
         # v_offset = (row * QK_HEAD_DIM + col) * sizeof(fp8)
         s_offset_i32 = _raw(warp_idx_i32 * arith.constant(16 * QK_HEAD_DIM, type=T.i32))
-        # Add qo_start offset: qo_start * NUM_QO_HEADS * QK_HEAD_DIM
+        # Add qo_start offset in the token-major physical Q layout.
         q_base_offset = _raw(
             arith.ArithValue(_raw(qo_start_i32))
-            * arith.constant(NUM_QO_HEADS * QK_HEAD_DIM, type=T.i32)
+            * arith.constant(num_qheads * QK_HEAD_DIM, type=T.i32)
         )
         s_offset_i32 = _raw(
             arith.ArithValue(s_offset_i32) + arith.ArithValue(q_base_offset)
@@ -1013,7 +1033,7 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
         result = [None] * 8
         for i in range_constexpr(8):
             result[i] = arith.MulFOp(
-                _raw(p_vals[i]), _raw(softmax_scale), fastmath=fm_fast
+                _raw(p_vals[i]), attention_scale, fastmath=fm_fast
             ).result
 
         if check_boundary is not False:
@@ -1152,6 +1172,7 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
         p_lds_kv_base,
         kv_tile_start_i32,
         kv_end_i32,
+        kv_mask_end_i32,
         q_nope,
         q_rope,
         row_max_in,
@@ -1285,7 +1306,7 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
             row_sum_e_in,
             is_first_iter,
             kv_tile_start_i32,
-            kv_end_i32,
+            kv_mask_end_i32,
             check_boundary,
         )
 
@@ -1796,17 +1817,50 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
             vec_width=4,
             dtype=T.i32,
         )
-        wi_dw5 = buffer_ops.buffer_load(
+        wi_dw5_6 = buffer_ops.buffer_load(
             work_info_set_rsrc,
             arith.addi(wi_base_i32, arith.constant(5, type=T.i32)),
-            vec_width=1,
+            vec_width=2,
             dtype=T.i32,
         )
         partial_qo_loc = rocdl.readfirstlane(T.i32, _raw(vector.extract(wi_dw1_4, [0])))
         qo_start = rocdl.readfirstlane(T.i32, _raw(vector.extract(wi_dw1_4, [1])))
         qo_end = rocdl.readfirstlane(T.i32, _raw(vector.extract(wi_dw1_4, [2])))
+        batch_idx = rocdl.readfirstlane(
+            T.i32,
+            _raw(buffer_ops.buffer_load(work_info_set_rsrc, wi_base_i32, vec_width=1, dtype=T.i32)),
+        )
         kv_start = rocdl.readfirstlane(T.i32, _raw(vector.extract(wi_dw1_4, [3])))
-        kv_end = rocdl.readfirstlane(T.i32, _raw(wi_dw5))
+        kv_end = rocdl.readfirstlane(T.i32, _raw(vector.extract(wi_dw5_6, [0])))
+        kv_offset = rocdl.readfirstlane(T.i32, _raw(vector.extract(wi_dw5_6, [1])))
+        kv_start = kv_start * arith.constant(page_size, type=T.i32)
+        kv_end_page = kv_end
+        kv_end = kv_end * arith.constant(page_size, type=T.i32)
+        if fx.const_expr(page_size > 1):
+            last_page_len = buffer_ops.buffer_load(
+                kv_last_page_lens_rsrc, batch_idx, vec_width=1, dtype=T.i32
+            )
+            tail_end = (
+                (kv_end_page - arith.constant(1, type=T.i32))
+                * arith.constant(page_size, type=T.i32)
+                + _raw(last_page_len)
+            )
+            kv_end = arith.select(
+                arith.cmpi(
+                    CmpIPredicate.eq,
+                    kv_offset,
+                    arith.constant(0, type=T.i32),
+                ),
+                tail_end,
+                kv_end,
+            )
+        query_position_from_last = qo_end - qo_start - arith.constant(1, type=T.i32)
+        query_position_from_last = query_position_from_last - query_position
+        causal_offset = arith.maxsi(
+            query_position_from_last - kv_offset,
+            arith.constant(0, type=T.i32),
+        )
+        kv_end_eff = kv_end - causal_offset
         kv_len = arith.subi(kv_end, kv_start)
 
         # ---- KV tile iteration ----
@@ -1938,6 +1992,7 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
                     p_lds_kv_0_base,
                     kv_start,
                     kv_end,
+                    kv_end_eff,
                     q_nope_packs,
                     q_rope_packs,
                     row_max,
@@ -1965,6 +2020,7 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
                     p_lds_kv_0_base,
                     kv_start,
                     kv_end,
+                    kv_end_eff,
                     q_nope_packs,
                     q_rope_packs,
                     row_max,
@@ -1994,6 +2050,7 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
                 p_lds_kv_0_base,
                 kv_start,
                 kv_end,
+                kv_end_eff,
                 q_nope_packs,
                 q_rope_packs,
                 row_max,
@@ -2027,7 +2084,7 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
                     lane_idx_i32
                     + warp_idx_i32 * arith.constant(16, type=T.i32)
                     + arith.ArithValue(pqo_loc_i32)
-                    * arith.constant(NUM_QO_HEADS, type=T.i32)
+                    * arith.constant(num_qheads, type=T.i32)
                 )
                 buffer_ops.buffer_store(lse, split_lse_rsrc, row_idx_i32)
 
@@ -2057,7 +2114,7 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
                 # bf16 final output: row_base = qo_start * NUM_QO_HEADS + warp*16
                 rb_bf16 = _raw(
                     arith.ArithValue(_raw(qo_start))
-                    * arith.constant(NUM_QO_HEADS, type=T.i32)
+                    * arith.constant(num_qheads, type=T.i32)
                     + warp_idx_i32 * arith.constant(16, type=T.i32)
                 )
                 _gemm2_last_with_store(
@@ -2076,7 +2133,7 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
                 # f32 split output: row_base = pqo_loc * NUM_QO_HEADS + warp*16
                 rb_split = _raw(
                     arith.ArithValue(_raw(partial_qo_loc))
-                    * arith.constant(NUM_QO_HEADS, type=T.i32)
+                    * arith.constant(num_qheads, type=T.i32)
                     + warp_idx_i32 * arith.constant(16, type=T.i32)
                 )
                 _gemm2_last_with_store(
@@ -2188,6 +2245,7 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
                         curr_base_idx,
                         kv_tile_start_i32,
                         _raw(kv_end),
+                        _raw(kv_end_eff),
                         q_nope_packs,
                         q_rope_packs,
                         rm_carried,
@@ -2215,6 +2273,7 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
                         curr_base_idx,
                         kv_tile_start_i32,
                         _raw(kv_end),
+                        _raw(kv_end_eff),
                         q_nope_packs,
                         q_rope_packs,
                         rm_carried,
@@ -2278,6 +2337,7 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
                 last_curr_base,
                 kv_last_start,
                 _raw(kv_end),
+                _raw(kv_end_eff),
                 q_nope_packs,
                 q_rope_packs,
                 row_max_mt,
@@ -2317,12 +2377,17 @@ def launch_mla_fwd_decode_m16x8_fp8_fp8(
     query: fx.Tensor,
     kv_buffer: fx.Tensor,
     kv_page_indices: fx.Tensor,
+    kv_last_page_lens: fx.Tensor,
     work_indptr: fx.Tensor,
     work_info_set: fx.Tensor,
     final_output: fx.Tensor,
     split_output: fx.Tensor,
     split_lse: fx.Tensor,
+    q_scale: fx.Tensor,
+    kv_scale: fx.Tensor,
     softmax_scale: fx.Float32,
+    num_qheads: fx.Constexpr[int],
+    page_size: fx.Constexpr[int],
     num_cus: fx.Constexpr,
     lds_size: fx.Constexpr,
     stream: fx.Stream = fx.Stream(None),
@@ -2335,12 +2400,17 @@ def launch_mla_fwd_decode_m16x8_fp8_fp8(
         query,
         kv_buffer,
         kv_page_indices,
+        kv_last_page_lens,
         work_indptr,
         work_info_set,
         final_output,
         split_output,
         split_lse,
+        q_scale,
+        kv_scale,
         softmax_scale,
+        num_qheads,
+        page_size,
     ).launch(
         grid=(num_cus, 1, 1),
         block=(NUM_THREADS, 1, 1),
