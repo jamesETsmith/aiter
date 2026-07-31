@@ -13,6 +13,8 @@ NOTE: Do NOT use ``from __future__ import annotations`` here -- it breaks
 ``fx.Constexpr`` detection in the FlyDSL AST rewriter.
 """
 
+import threading
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -2365,6 +2367,10 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
 # ---------------------------------------------------------------------------
 # JIT launcher
 # ---------------------------------------------------------------------------
+_MLA_COMPILED_LOCK = threading.Lock()
+_MLA_COMPILED = {}
+
+
 @flyc.jit
 def launch_mla_fwd_decode_m16x8_fp8_fp8(
     query: fx.Tensor,
@@ -2410,3 +2416,61 @@ def launch_mla_fwd_decode_m16x8_fp8_fp8(
         smem=0,  # LDS is statically allocated via SmemAllocator
         stream=stream,
     )
+
+
+def run_mla_fwd_decode_m16x8_fp8_fp8(
+    query,
+    kv_buffer,
+    kv_page_indices,
+    kv_last_page_lens,
+    work_indptr,
+    work_info_set,
+    final_output,
+    split_output,
+    split_lse,
+    q_scale,
+    kv_scale,
+    softmax_scale,
+    num_qheads,
+    page_size,
+    num_cus,
+    lds_size,
+    stream,
+):
+    args = (
+        query,
+        kv_buffer,
+        kv_page_indices,
+        kv_last_page_lens,
+        work_indptr,
+        work_info_set,
+        final_output,
+        split_output,
+        split_lse,
+        q_scale,
+        kv_scale,
+        softmax_scale,
+        num_qheads,
+        page_size,
+        num_cus,
+        lds_size,
+        stream,
+    )
+    key = (
+        query.device.index,
+        query.dtype,
+        kv_buffer.dtype,
+        num_qheads,
+        page_size,
+        num_cus,
+        lds_size,
+    )
+    compiled = _MLA_COMPILED.get(key)
+    if compiled is None:
+        with _MLA_COMPILED_LOCK:
+            compiled = _MLA_COMPILED.get(key)
+            if compiled is None:
+                compiled = flyc.compile(launch_mla_fwd_decode_m16x8_fp8_fp8, *args)
+                _MLA_COMPILED[key] = compiled
+                return
+    compiled(*args)

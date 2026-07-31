@@ -72,7 +72,7 @@ def flydsl_mla_decode_stage1_fwd(
             OCCUPANCY,
             QK_HEAD_DIM,
             V_HEAD_DIM,
-            launch_mla_fwd_decode_m16x8_fp8_fp8,
+            run_mla_fwd_decode_m16x8_fp8_fp8,
         )
 
         num_seqs = query.size(0)
@@ -97,7 +97,7 @@ def flydsl_mla_decode_stage1_fwd(
         num_cus = get_cu_num()
         lds_size = get_lds_size_per_cu() // OCCUPANCY
 
-        launch_mla_fwd_decode_m16x8_fp8_fp8(
+        run_mla_fwd_decode_m16x8_fp8_fp8(
             query_flat,
             kv_flat,
             kv_idx_flat,
@@ -114,7 +114,7 @@ def flydsl_mla_decode_stage1_fwd(
             page_size,
             num_cus,
             lds_size,
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )
     else:
         raise NotImplementedError(
