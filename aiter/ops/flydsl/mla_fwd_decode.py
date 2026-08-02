@@ -9,7 +9,9 @@ and dtype, then prepares tensors and dispatches via ``@flyc.jit``.
 
 import torch
 
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_lds_size_per_cu
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+
+from .utils import get_shared_memory_per_block
 
 
 def _is_fp8(dtype: torch.dtype) -> bool:
@@ -95,7 +97,7 @@ def flydsl_mla_decode_stage1_fwd(
         kv_idx_flat = kv_page_indices.contiguous()
 
         num_cus = get_cu_num()
-        lds_size = get_lds_size_per_cu() // OCCUPANCY
+        lds_size = get_shared_memory_per_block(query.device) // OCCUPANCY
 
         run_mla_fwd_decode_m16x8_fp8_fp8(
             query_flat,
