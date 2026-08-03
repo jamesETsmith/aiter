@@ -437,7 +437,6 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
     warp_idx_i32 = rocdl.readfirstlane(T.i32, _raw(_index_cast_to_i32(warp_idx)))
     lane_idx_i32 = _index_cast_to_i32(lane_idx)
     waves_per_query = num_qheads // TILE_M
-    query_position = warp_idx_i32 // arith.constant(waves_per_query, type=T.i32)
 
     # ---- Work range ----
     worker_idx_i32 = _index_cast_to_i32(worker_idx)
@@ -899,7 +898,7 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
         return w
 
     # ---- Helper: Q loading (QManagerV3) ----
-    def _load_q_to_regs(qo_start_i32):
+    def _load_q_to_regs(qo_start_i32, query_wave_i32):
         """Load Q from VRAM to registers via LDS staging.
 
         QManagerV3: each warp loads 16x64 per pass, 9 passes total.
@@ -917,7 +916,9 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
         # VRAM addressing: row = lane/4, col = (lane%4)*16
         # s_offset = warp * 16 * QK_HEAD_DIM * sizeof(fp8)
         # v_offset = (row * QK_HEAD_DIM + col) * sizeof(fp8)
-        s_offset_i32 = _raw(warp_idx_i32 * arith.constant(16 * QK_HEAD_DIM, type=T.i32))
+        s_offset_i32 = _raw(
+            query_wave_i32 * arith.constant(16 * QK_HEAD_DIM, type=T.i32)
+        )
         # Add qo_start offset in the token-major physical Q layout.
         q_base_offset = _raw(
             arith.ArithValue(_raw(qo_start_i32))
@@ -1851,7 +1852,13 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
                 tail_end,
                 kv_end,
             )
-        query_position_from_last = qo_end - qo_start - arith.constant(1, type=T.i32)
+        query_span = qo_end - qo_start
+        valid_query_waves = query_span * arith.constant(waves_per_query, type=T.i32)
+        query_wave_idx = arith.minsi(
+            warp_idx_i32, valid_query_waves - arith.constant(1, type=T.i32)
+        )
+        query_position = query_wave_idx // arith.constant(waves_per_query, type=T.i32)
+        query_position_from_last = query_span - arith.constant(1, type=T.i32)
         query_position_from_last = query_position_from_last - query_position
         causal_offset = arith.maxsi(
             query_position_from_last - kv_offset,
@@ -1900,7 +1907,7 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
         row_kv_ld_first = if_setup.results[0]
 
         # Load Q to GPR (independent of boundary check)
-        q_nope_packs, q_rope_packs = _load_q_to_regs(qo_start)
+        q_nope_packs, q_rope_packs = _load_q_to_regs(qo_start, query_wave_idx)
 
         # Async load first tile KV to LDS (branched)
         if_load = scf.IfOp(first_tile_needs_boundary, [], has_else=True)
@@ -2077,7 +2084,7 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
                 lse = arith.AddFOp(_raw(rm), ln_sum, fastmath=fm_fast).result
                 row_idx_i32 = _raw(
                     lane_idx_i32
-                    + warp_idx_i32 * arith.constant(16, type=T.i32)
+                    + query_wave_idx * arith.constant(16, type=T.i32)
                     + arith.ArithValue(pqo_loc_i32)
                     * arith.constant(num_qheads, type=T.i32)
                 )
@@ -2110,7 +2117,7 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
                 rb_bf16 = _raw(
                     arith.ArithValue(_raw(qo_start))
                     * arith.constant(num_qheads, type=T.i32)
-                    + warp_idx_i32 * arith.constant(16, type=T.i32)
+                    + query_wave_idx * arith.constant(16, type=T.i32)
                 )
                 _gemm2_last_with_store(
                     pp,
@@ -2129,7 +2136,7 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
                 rb_split = _raw(
                     arith.ArithValue(_raw(partial_qo_loc))
                     * arith.constant(num_qheads, type=T.i32)
-                    + warp_idx_i32 * arith.constant(16, type=T.i32)
+                    + query_wave_idx * arith.constant(16, type=T.i32)
                 )
                 _gemm2_last_with_store(
                     pp,
