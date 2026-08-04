@@ -18,6 +18,23 @@ def _is_fp8(dtype: torch.dtype) -> bool:
     return dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
 
 
+def get_flydsl_mla_kernel_name(
+    batch_size: int,
+    max_seqlen_q: int,
+    max_seqlen_kv: int,
+    num_heads: int,
+    page_size: int,
+) -> str:
+    if (
+        batch_size >= 16
+        and max_seqlen_q <= 16
+        and max_seqlen_kv >= 16384
+        and page_size == 1
+    ):
+        return "bn64_v3"
+    return "bn32"
+
+
 def flydsl_mla_decode_stage1_fwd(
     query: torch.Tensor,  # [num_seqs, num_heads, head_size]
     kv_buffer: torch.Tensor,  # [num_page, page_size, num_kv_heads, head_size]
@@ -98,6 +115,38 @@ def flydsl_mla_decode_stage1_fwd(
 
         num_cus = get_cu_num()
         lds_size = get_shared_memory_per_block(query.device) // OCCUPANCY
+        batch_size = qo_indptr.numel() - 1
+        max_seqlen_kv = num_pages * page_size // batch_size
+        kernel_name = get_flydsl_mla_kernel_name(
+            batch_size,
+            max_seqlen_q,
+            max_seqlen_kv,
+            num_heads,
+            page_size,
+        )
+        if kernel_name == "bn64_v3":
+            from .kernels.mla_fwd_decode_m16x8_fp8_fp8_bn64 import (
+                run_mla_fwd_decode_m16x8_fp8_fp8 as run_bn64,
+            )
+
+            run_bn64(
+                query_flat,
+                kv_flat,
+                kv_idx_flat,
+                work_indptr_flat,
+                work_info_flat,
+                final_flat,
+                split_o_flat,
+                split_lse_flat,
+                q_scale.contiguous(),
+                kv_scale.contiguous(),
+                softmax_scale,
+                num_heads,
+                num_cus,
+                lds_size,
+                torch.cuda.current_stream(),
+            )
+            return
 
         run_mla_fwd_decode_m16x8_fp8_fp8(
             query_flat,
