@@ -145,6 +145,196 @@ TUNE_MOE_EXPERT_BALANCE = (
     os.environ.get("TUNE_MOE_EXPERT_BALANCE", "False").lower() == "true"
 )
 
+
+def _ep_size() -> int:
+    """Expert-parallel degree to tune for (TUNE_MOE_EP_SIZE, set by --ep-size).
+
+    Above 1, a row's `expert` is one rank's local experts out of
+    `expert * ep_size` global experts: routing draws top-k over the global
+    pool and only this rank's (token, slot) pairs reach the kernels, as with
+    fused_moe(..., expert_mask=...) under EP. With dense local routing a
+    decode bucket activates nearly every local expert; under EP it activates
+    about topk * token / ep_size of them.
+    """
+    return int(os.environ.get("TUNE_MOE_EP_SIZE", "1"))
+
+
+def _bucket_rows(token: int) -> int:
+    """Rows to time a `token` bucket at (TUNE_MOE_BUCKET_ROWS_FRAC, set by
+    --bucket-rows-frac).
+
+    fused_moe looks configs up by the next power of two of the row count, so
+    bucket M serves (M/2, M] rows; timing at M is the heaviest case. A
+    fraction of 0.75 times the middle of that range.
+    """
+    frac = float(os.environ.get("TUNE_MOE_BUCKET_ROWS_FRAC", "1"))
+    return max(1, min(token, round(token * frac)))
+
+
+def _ep_routing(token, expert, topk, ep, dtype):
+    """Pick a representative EP routing for one rank.
+
+    Returns (score over the global experts, expert_mask, local_ids) where
+    expert_mask follows the runtime's layout (global + 1 entries, the last
+    one the fake expert) and local_ids maps a global id to its local id, or
+    to `expert` (out of range, skipped by the torch references) when the
+    expert lives on another rank. Per-rank load varies a lot at decode token
+    counts and the step waits for the slowest rank, so over
+    TUNE_MOE_EP_DRAWS draws this takes the most-loaded rank of each and
+    returns the median of those.
+    """
+    num_global = expert * ep
+    gen = torch.Generator(device="cpu").manual_seed(
+        int(os.environ.get("TUNE_MOE_ROUTING_SEED", "0"))
+    )
+    draws = []
+    for _ in range(int(os.environ.get("TUNE_MOE_EP_DRAWS", "64"))):
+        score = torch.randn((token, num_global), generator=gen, device="cpu")
+        score = score.to(dtype)
+        ids = score.float().topk(topk, dim=1).indices
+        load = torch.bincount(ids.flatten() // expert, minlength=ep)
+        rank = int(load.argmax())
+        local = ids[(ids // expert) == rank]
+        draws.append((int(load[rank]), int(local.unique().numel()), score, rank))
+    draws.sort(key=lambda d: (d[0], d[1]))
+    _, _, score, rank = draws[len(draws) // 2]
+    expert_mask = torch.zeros((num_global + 1,), dtype=dtypes.i32)
+    expert_mask[rank * expert : (rank + 1) * expert] = 1
+    local_ids = torch.full((num_global + 1,), expert, dtype=dtypes.i32)
+    local_ids[rank * expert : (rank + 1) * expert] = torch.arange(
+        expert, dtype=dtypes.i32
+    )
+    return score.to("cuda"), expert_mask, local_ids
+
+
+class _EpUnroutedRef:
+    """Wrap a stage-1 reference so slots routed to other ranks become NaN.
+
+    Kernels never write those [token, topk, :] slots, so _ep_masked_compare
+    drops them. `topk_ids` (local ids, `expert` when unrouted) is appended
+    after the wrapped reference's data keys.
+    """
+
+    def __init__(self, ref_func, num_data_keys, expert):
+        self.ref_func = ref_func
+        self.num_data_keys = num_data_keys
+        self.expert = expert
+
+    def __call__(self, *args, **kwargs):
+        n = self.num_data_keys
+        topk_ids = args[n]
+        ref = self.ref_func(*args[:n], *args[n + 1 :], **kwargs)
+        token, topk = topk_ids.shape
+        if not (
+            isinstance(ref, torch.Tensor)
+            and ref.dim() >= 2
+            and ref.shape[0] >= token
+            and ref.shape[1] == topk
+        ):
+            return ref
+        ref = ref.to(dtypes.fp32) if ref.element_size() == 1 else ref.clone()
+        ref[:token][topk_ids >= self.expert] = float("nan")
+        return ref
+
+
+def _ep_masked_compare(rtol, atol, tol_err_ratio, ref, res, msg="", printLog=False):
+    from aiter.test_common import checkAllclose
+
+    if res.shape != ref.shape:
+        res = res.view(-1)[: ref.numel()].view(ref.shape)
+    keep = ~torch.isnan(ref.to(dtypes.fp32))
+    return checkAllclose(
+        ref.to(dtypes.fp32)[keep],
+        res.to(dtypes.fp32)[keep],
+        atol=atol,
+        rtol=rtol,
+        tol_err_ratio=tol_err_ratio,
+        printLog=printLog,
+        msg=msg,
+    )
+
+
+def _time_at_bucket_rows(tasks):
+    """Generate each task's data at _bucket_rows(token) rows; the key stays.
+
+    Only data generators whose first argument is the row count are rewritten;
+    other tasks keep timing the full bucket.
+    """
+    rows_first = {
+        "generate_data_2stages",
+        "generate_asm_stage1",
+        "generate_data_1stage",
+        "generate_opus_sorted_stage2_data",
+    }
+    out = []
+    for task in tasks:
+        tag, gen_data, gen_args, *rest = task
+        token = int(tag[0][2])
+        if (
+            gen_data is not None
+            and getattr(gen_data, "__name__", "") in rows_first
+            and gen_args
+            and gen_args[0] == token
+        ):
+            task = (tag, gen_data, (_bucket_rows(token), *gen_args[1:]), *rest)
+        out.append(task)
+    return out
+
+
+def _ep_adapt_tasks(tasks, err_ratio):
+    """Fit candidate tasks to EP routing (see _ep_size).
+
+    Candidates that read raw topk_ids/topk_weights are dropped: under EP the
+    runtime only takes the host-sorted path, where moe_sorting applies the
+    expert mask. Stage-1 references mark unrouted slots for the comparison.
+    """
+    adapted = []
+    for task in tasks:
+        (
+            tag,
+            gen_data,
+            gen_args,
+            func,
+            func_args,
+            func_kwargs,
+            ref_func,
+            ref_args,
+            ref_kwargs,
+            ref,
+            *rest,
+        ) = task
+        if gen_data is None:
+            adapted.append(task)
+            continue
+        data_keys = list(func_args[0])
+        if "topk_ids" in data_keys or "topk_weights" in data_keys:
+            continue
+        if tag[1] == "stage1" and ref_func is not None and ref is None:
+            ref_keys, *ref_rest = ref_args
+            ref_func = _EpUnroutedRef(ref_func, len(ref_keys), int(tag[0][5]))
+            ref_args = ([*ref_keys, "topk_ids"], *ref_rest)
+            rtol = rest[0] if len(rest) > 0 else 1e-2
+            atol = rest[1] if len(rest) > 1 else 1e-2
+            if not (len(rest) > 2 and callable(rest[2])):
+                compare = functools.partial(_ep_masked_compare, rtol, atol, err_ratio)
+                rest = [rtol, atol, compare, *rest[3:]]
+        adapted.append(
+            (
+                tag,
+                gen_data,
+                gen_args,
+                func,
+                func_args,
+                func_kwargs,
+                ref_func,
+                ref_args,
+                ref_kwargs,
+                ref,
+                *rest,
+            )
+        )
+    return adapted
+
 COS_DIFF_THRESHOLD = 1e-1
 
 
@@ -721,6 +911,23 @@ class FmoeTuner(TunerCommon):
             help="Only last kernel is tuned, if not, only kernels that are not in the tuned_fmoe.csv are tuned",
         )
         self.parser.add_argument(
+            "--ep-size",
+            type=int,
+            default=None,
+            help="Tune for expert parallelism of this degree: each row's expert "
+            "count is one rank's local experts, routing draws top-k over "
+            "expert * ep-size global experts and masks to this rank "
+            "(sets TUNE_MOE_EP_SIZE). Default 1, dense local routing.",
+        )
+        self.parser.add_argument(
+            "--bucket-rows-frac",
+            type=float,
+            default=None,
+            help="Time each token bucket M at round(frac * M) rows instead of M "
+            "(sets TUNE_MOE_BUCKET_ROWS_FRAC). Bucket M serves (M/2, M] rows; "
+            "0.75 times the middle of that range. Default 1.",
+        )
+        self.parser.add_argument(
             "--grouped-gemm",
             action="store_true",
             required=False,
@@ -749,6 +956,23 @@ class FmoeTuner(TunerCommon):
 
     def parse_args(self) -> argparse.Namespace:
         args = super().parse_args()
+        if args.ep_size is not None:
+            if args.ep_size < 1:
+                self.parser.error("--ep-size must be >= 1")
+            # Spawned tuning workers read the degree from the environment.
+            os.environ["TUNE_MOE_EP_SIZE"] = str(args.ep_size)
+        if args.bucket_rows_frac is not None:
+            if not 0 < args.bucket_rows_frac <= 1:
+                self.parser.error("--bucket-rows-frac must be in (0, 1]")
+            os.environ["TUNE_MOE_BUCKET_ROWS_FRAC"] = str(args.bucket_rows_frac)
+        if _ep_size() > 1:
+            if TUNE_MOE_EXPERT_BALANCE:
+                self.parser.error("--ep-size conflicts with TUNE_MOE_EXPERT_BALANCE")
+            if args.grouped_gemm or args.mxfp4_flydsl:
+                self.parser.error(
+                    "--ep-size supports the default fmoe tuner only, not "
+                    "--grouped-gemm or --mxfp4-flydsl"
+                )
         if getattr(args, "fast_scan", False) and not self.SUPPORTS_FAST_SCAN:
             self.parser.error("--fast-scan requires --mxfp4-flydsl")
         if not hasattr(args, "fast_scan"):
@@ -1849,7 +2073,13 @@ class FmoeTuner(TunerCommon):
         else:
             w1_qt = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
             w2_qt = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
-        if TUNE_MOE_EXPERT_BALANCE:
+        ep = _ep_size()
+        expert_mask = None
+        if ep > 1:
+            score, expert_mask, local_ids = _ep_routing(
+                token, expert, topk, ep, dtype
+            )
+        elif TUNE_MOE_EXPERT_BALANCE:
             score = torch.zeros((token, expert), dtype=dtype)
             start_col = 0
             end_col = topk
@@ -1894,8 +2124,24 @@ class FmoeTuner(TunerCommon):
             w1_qt_shffle = w1_qt
             w2_qt_shffle = w2_qt
 
+        if expert_mask is None:
+            sorting = moe_sorting(
+                topk_ids, topk_weights, expert, model_dim, dtype, blockM
+            )
+        else:
+            expert_mask = expert_mask.to(topk_ids.device)
+            sorting = moe_sorting(
+                topk_ids,
+                topk_weights,
+                expert_mask.numel(),
+                model_dim,
+                dtype,
+                blockM,
+                expert_mask,
+            )
+            topk_ids = local_ids.to(topk_ids.device)[topk_ids.long()]
         sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
-            moe_sorting(topk_ids, topk_weights, expert, model_dim, dtype, blockM)
+            sorting[:5]
         )
         needed = sorted_expert_ids.shape[0] * blockM
         if sorted_ids.shape[0] < needed:
@@ -4971,7 +5217,7 @@ class FmoeTuner(TunerCommon):
         results = []
         for i in range(len(untunedf)):
             row = untunedf.iloc[i]
-            token = int(row["token"])
+            token = _bucket_rows(int(row["token"]))
             model_dim = int(row["model_dim"])
             inter_dim = int(row["inter_dim"])
             expert = int(row["expert"])
@@ -5165,8 +5411,21 @@ class FmoeTuner(TunerCommon):
                 w1_qt_fmoe.is_shuffled = True
                 w2_qt_fmoe.is_shuffled = True
 
-                score = torch.randn((token, expert), dtype=dtype, device="cuda")
+                ep = _ep_size()
+                if ep > 1:
+                    score, expert_mask, local_ids = _ep_routing(
+                        token, expert, topk, ep, dtype
+                    )
+                    expert_mask = expert_mask.to("cuda")
+                else:
+                    score = torch.randn((token, expert), dtype=dtype, device="cuda")
+                    expert_mask = None
                 topk_weights, topk_ids = fused_topk(hidden, score, topk, True)
+                # fused_moe takes global ids and the mask; the references index
+                # local experts, with `expert` marking other ranks' slots.
+                fmoe_topk_ids = topk_ids
+                if expert_mask is not None:
+                    topk_ids = local_ids.to("cuda")[topk_ids.long()]
                 if q_type == QuantType.per_1x128:
                     a1_qt, a1_scale = aiter.pertoken_quant(
                         hidden.view(token, -1, 128), quant_dtype=q_dtype_a
@@ -5207,7 +5466,8 @@ class FmoeTuner(TunerCommon):
                     w1_qt_fmoe,
                     w2_qt_fmoe,
                     topk_weights,
-                    topk_ids,
+                    fmoe_topk_ids,
+                    expert_mask=expert_mask,
                     activation=act_type,
                     quant_type=q_type,
                     doweight_stage1=doweight_stage1,
@@ -5473,6 +5733,15 @@ class FmoeTuner(TunerCommon):
             pattern = re.compile(kernel_regex)
             all_tasks = [task for task in all_tasks if pattern.search(task[0][2])]
             print(f"filtered tuning tasks with {kernel_regex!r}: {len(all_tasks)}")
+        if os.environ.get("TUNE_MOE_BUCKET_ROWS_FRAC"):
+            all_tasks = _time_at_bucket_rows(all_tasks)
+        if _ep_size() > 1:
+            num_tasks = len(all_tasks)
+            all_tasks = _ep_adapt_tasks(all_tasks, args.errRatio)
+            print(
+                f"EP{_ep_size()} routing: {len(all_tasks)} of {num_tasks} tasks "
+                "(dropped candidates that read raw topk_ids)"
+            )
         # Record dispatched cases
         dispatched = {}
         for i, task in enumerate(all_tasks):
