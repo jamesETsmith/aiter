@@ -186,8 +186,11 @@ def _ep_routing(token, expert, topk, ep, dtype):
     expert lives on another rank. Per-rank load varies a lot at decode token
     counts and the step waits for the slowest rank, so over
     TUNE_MOE_EP_DRAWS draws this takes the most-loaded rank of each and
-    returns the median of those.
+    returns the median of those. TUNE_MOE_EP_RANK=median (--ep-rank) takes
+    each draw's median-loaded rank instead, for workloads whose routing is
+    more concentrated than uniform (e.g. a request's speculative rows).
     """
+    pick = os.environ.get("TUNE_MOE_EP_RANK", "max")
     num_global = expert * ep
     gen = torch.Generator(device="cpu").manual_seed(
         int(os.environ.get("TUNE_MOE_ROUTING_SEED", "0"))
@@ -198,7 +201,10 @@ def _ep_routing(token, expert, topk, ep, dtype):
         score = score.to(dtype)
         ids = score.float().topk(topk, dim=1).indices
         load = torch.bincount(ids.flatten() // expert, minlength=ep)
-        rank = int(load.argmax())
+        if pick == "max":
+            rank = int(load.argmax())
+        else:
+            rank = int(load.argsort()[ep // 2])
         local = ids[(ids // expert) == rank]
         draws.append((int(load[rank]), int(local.unique().numel()), score, rank))
     draws.sort(key=lambda d: (d[0], d[1]))
@@ -946,6 +952,13 @@ class FmoeTuner(TunerCommon):
             "0.75 times the middle of that range. Default 1.",
         )
         self.parser.add_argument(
+            "--ep-rank",
+            choices=["max", "median"],
+            default=None,
+            help="With --ep-size, which rank's routing to time: the most-loaded "
+            "(default) or the median-loaded (sets TUNE_MOE_EP_RANK).",
+        )
+        self.parser.add_argument(
             "--grouped-gemm",
             action="store_true",
             required=False,
@@ -1017,6 +1030,8 @@ class FmoeTuner(TunerCommon):
             if not 0 < args.bucket_rows_frac <= 1:
                 self.parser.error("--bucket-rows-frac must be in (0, 1]")
             os.environ["TUNE_MOE_BUCKET_ROWS_FRAC"] = str(args.bucket_rows_frac)
+        if args.ep_rank is not None:
+            os.environ["TUNE_MOE_EP_RANK"] = args.ep_rank
         if _ep_size() > 1:
             if TUNE_MOE_EXPERT_BALANCE:
                 self.parser.error("--ep-size conflicts with TUNE_MOE_EXPERT_BALANCE")
