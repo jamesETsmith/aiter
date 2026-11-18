@@ -258,13 +258,30 @@ def gen(
     activation=ActivationType.Silu,
     situ_beta=DEFAULT_SITUV2_BETA,
     situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+    ep_routing=None,
 ):
+    """Build inputs and references for one shape.
+
+    ep_routing, when given, is (score over the global experts, expert_mask,
+    local_ids) for one expert-parallel rank: kernels see only that rank's
+    (token, slot) pairs, sorted with expert_mask as fused_moe does, and
+    `topk_ids` holds local ids with E marking slots routed to other ranks.
+    """
     torch.manual_seed(0)
     inp = torch.randn((token, model_dim), dtype=dtypes.bf16) / 10
     w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtypes.bf16) / 10
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtypes.bf16) / 10
-    score = balanced_score(token, E, topk, dtypes.bf16)
-    topk_weights, topk_ids = fused_topk(inp, score, topk, True)
+    expert_mask = None
+    if ep_routing is None:
+        score = balanced_score(token, E, topk, dtypes.bf16)
+        topk_weights, topk_ids = fused_topk(inp, score, topk, True)
+        sort_ids, sort_experts = topk_ids, E
+    else:
+        score, expert_mask, local_ids = ep_routing
+        topk_weights, sort_ids = fused_topk(inp, score.to(inp.device), topk, True)
+        expert_mask = expert_mask.to(inp.device)
+        sort_experts = expert_mask.numel()
+        topk_ids = local_ids.to(inp.device)[sort_ids.long()]
 
     w1_qt, w1_scale = quant_w(w1, b_dtype)
     w2_qt, w2_scale = quant_w(w2, b_dtype)
@@ -326,7 +343,13 @@ def gen(
 
     # ---- baseline (aiter mixed_moe stage1) prep ----
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
-        topk_ids, topk_weights, E, model_dim, dtypes.bf16, block_m
+        sort_ids,
+        topk_weights,
+        sort_experts,
+        model_dim,
+        dtypes.bf16,
+        block_m,
+        expert_mask,
     )
     # w1/w1_scale preshuffle depends on the activation dtype (a8w4 vs a4w4);
     # see _baseline_w1_shuffle. w2 always uses the a16w4 down-proj layout.
@@ -381,6 +404,9 @@ def gen(
         "ref2_quantized": ref2_quantized,
         "topk_ids": topk_ids,
         "topk_weights": topk_weights,
+        "sort_ids": sort_ids,
+        "sort_experts": sort_experts,
+        "expert_mask": expert_mask,
         "w1_qt": w1_qt,
         "w1_scale": w1_scale,
         "w2_qt": w2_qt,
@@ -403,16 +429,22 @@ def build_v2_inputs(d, token, model_dim, inter_dim, E, topk, BM_S1):
     w2u8 = _u8v(d["base"]["w2_qt_shuf"])
     w2sc = _u8v(d["base"]["w2_scale_shuf"])
 
-    topk_ids_i32 = d["topk_ids"].to(torch.int32)
+    # Under EP the sort runs over the global experts with expert_mask and
+    # emits local expert ids, as in fused_moe.
+    sort_ne = d.get("sort_experts", NE)
+    expert_mask = d.get("expert_mask")
+    topk_ids_i32 = d.get("sort_ids", d["topk_ids"]).to(torch.int32)
     topk_w_f32 = d["topk_weights"].to(torch.float32)
-    max_padded = token * TOPK + NE * SBM - TOPK
+    max_padded = token * TOPK + sort_ne * SBM - TOPK
     max_sorted = ((max_padded + SBM - 1) // SBM) * SBM
     sti = torch.empty(max_sorted, dtype=torch.int32, device=device)
     swt = torch.empty(max_sorted, dtype=torch.float32, device=device)
     sei = torch.empty(max_sorted // SBM, dtype=torch.int32, device=device)
     nv = torch.empty(2, dtype=torch.int32, device=device)
     moe_buf = torch.empty((token, H), dtype=torch.bfloat16, device=device)
-    moe_sorting_flydsl(topk_ids_i32, topk_w_f32, sti, swt, sei, nv, moe_buf, NE, SBM)
+    moe_sorting_flydsl(
+        topk_ids_i32, topk_w_f32, sti, swt, sei, nv, moe_buf, sort_ne, SBM, expert_mask
+    )
     torch.cuda.synchronize()
     cumsum = nv
     n = int(cumsum[0].item())

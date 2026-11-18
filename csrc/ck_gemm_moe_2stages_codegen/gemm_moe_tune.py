@@ -213,6 +213,14 @@ def _ep_routing(token, expert, topk, ep, dtype):
     return score.to("cuda"), expert_mask, local_ids
 
 
+def _v2_ep_routing(token, expert, topk):
+    """EP routing for the FlyDSL v2 data generators, or None without --ep-size."""
+    ep = _ep_size()
+    if ep <= 1:
+        return None
+    return _ep_routing(token, expert, topk, ep, dtypes.bf16)
+
+
 class _EpUnroutedRef:
     """Wrap a stage-1 reference so slots routed to other ranks become NaN.
 
@@ -271,6 +279,8 @@ def _time_at_bucket_rows(tasks):
         "generate_asm_stage1",
         "generate_data_1stage",
         "generate_opus_sorted_stage2_data",
+        "generate_v2_stage1_data",
+        "generate_v2_stage2_data",
     }
     out = []
     for task in tasks:
@@ -1483,6 +1493,7 @@ class FmoeTuner(TunerCommon):
                 activation=act_type,
                 situ_beta=DEFAULT_SITUV2_BETA,
                 situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+                ep_routing=_v2_ep_routing(token, expert, topk),
             )
         v = _v2_build_inputs(d, token, model_dim, inter_dim, expert, topk, blockM)
         # Precompute the sorted A-scale here so it is NOT timed in the run func.
@@ -1592,6 +1603,7 @@ class FmoeTuner(TunerCommon):
             activation=act_type,
             situ_beta=DEFAULT_SITUV2_BETA,
             situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+            ep_routing=_v2_ep_routing(token, expert, topk),
         )
         v = _v2_build_inputs(d, token, model_dim, inter_dim, expert, topk, blockM)
         _v2_populate_stage2(d, v, token, topk, blockM)
@@ -4632,6 +4644,10 @@ class FmoeTuner(TunerCommon):
                 inter_dim=inter_dim,
             ).items():
                 kp = {**kp, "a_dtype": adtype}
+                # With expert_mask the runtime accumulates atomically; reduce
+                # would also sum the [token, topk] slots other ranks own.
+                if _ep_size() > 1 and kp.get("epilog") == "reduce":
+                    continue
                 # flat=0, v2=1
                 tasks.append(
                     (
