@@ -297,7 +297,18 @@ def _time_at_bucket_rows(tasks):
             and gen_args
             and gen_args[0] == token
         ):
-            task = (tag, gen_data, (_bucket_rows(token), *gen_args[1:]), *rest)
+            rows = _bucket_rows(token)
+            # The v2 stage-1 reference also takes the row count, to tell
+            # padding rows (token id == rows) from real ones.
+            if (
+                getattr(gen_data, "__name__", "") == "generate_v2_stage1_data"
+                and len(rest) > 4
+                and len(rest[4]) > 1
+                and rest[4][1] == token
+            ):
+                ref_args = rest[4]
+                rest = [*rest[:4], (ref_args[0], rows, *ref_args[2:]), *rest[5:]]
+            task = (tag, gen_data, (rows, *gen_args[1:]), *rest)
         out.append(task)
     return out
 
